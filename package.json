@@ -3,10 +3,6 @@
   "version": "1.0.0",
   "description": "Proxy server for Gemini API",
   "main": "api/gemini.js",
-  "scripts": {
-    "dev": "vercel dev",
-    "build": "vercel build"
-  },
   "keywords": ["gemini", "proxy", "api"],
   "author": "",
   "license": "MIT",
