@@ -57,6 +57,10 @@ export default async function handler(req, res) {
       });
     }
     
+    // ========================================
+    // CRITICAL: MODERATION FIRST - Block bad requests BEFORE calling Gemini API
+    // ========================================
+    
     // Simple content moderation - block obvious harmful content
     const harmfulPatterns = [
       /\b(bomb|explosive|weapon|kill|murder|suicide)\b/i,
@@ -66,6 +70,7 @@ export default async function handler(req, res) {
     
     const isHarmful = harmfulPatterns.some(pattern => pattern.test(user_query));
     
+    // If moderation fails, DO NOT call Gemini - return immediately
     if (isHarmful) {
       const moderationResponse = "I can't assist with that request. Let me offer you a peaceful thought instead: " + 
         FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
@@ -84,11 +89,16 @@ export default async function handler(req, res) {
         console.error('Firestore logging error:', logError);
       }
       
+      // Return early - Gemini API is NOT called for bad requests
       return res.status(200).json({
         response: moderationResponse,
         source: 'moderation'
       });
     }
+    
+    // ========================================
+    // Moderation passed - NOW safe to call Gemini API
+    // ========================================
     
     // Minimal, robust prompt for dumb models
     const prompt = `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 1-2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 250 characters, NO explanations, NO extra text, ONLY prayer. Examples: Om Aiṃ Sarasvatyai Namaḥ। Om Gaṇ Gaṇapataye Namaḥ। May your mind be sharp and your efforts rewarded. Om Shanti Shanti Shantiḥ. Om Durgāyai Namaḥ। Om Hanumate Namaḥ। May you find strength and courage to face any challenge. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
