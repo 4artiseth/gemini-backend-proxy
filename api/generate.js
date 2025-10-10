@@ -1,6 +1,5 @@
-4// generate.js - Safe free-tier backend with moderation, cache, and fallback
+// generate.js - Safe free-tier backend with moderation, cache, and fallback
 import admin from 'firebase-admin';
-
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -9,11 +8,9 @@ if (!admin.apps.length) {
   });
 }
 const db = admin.firestore();
-
 // In-memory cache
 const cache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
-
 // Fallback prayers for rate limits
 const FALLBACK_PRAYERS = [
   "Om Shanti Shanti Shanti",
@@ -22,10 +19,8 @@ const FALLBACK_PRAYERS = [
   "Om Namah Shivaya",
   "Lokah Samastah Sukhino Bhavantu"
 ];
-
 // Fixed model name constant - gemini-2.5-flash-lite only
 const MODEL_NAME = 'gemini-2.5-flash-lite';
-
 export default async function handler(req, res) {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -47,6 +42,57 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'user_query is required and must be a string' });
     }
     
+    // ========================================
+    // OPENAI MODERATION API - First layer of defense
+    // ========================================
+    
+    try {
+      const moderationResponse = await fetch('https://api.openai.com/v1/moderations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          input: user_query
+        })
+      });
+      
+      if (moderationResponse.ok) {
+        const moderationData = await moderationResponse.json();
+        const isFlagged = moderationData.results?.[0]?.flagged;
+        
+        if (isFlagged) {
+          const blockMessage = "I can't assist with that request. Let me offer you a peaceful thought instead: " + 
+            FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
+          
+          // Log OpenAI moderation block to Firestore: moderated false
+          try {
+            await db.collection('requests').add({
+              user_query: user_query,
+              response: blockMessage,
+              generated_prayer: null,
+              moderated: false,
+              openai_flagged: true,
+              timestamp: admin.firestore.FieldValue.serverTimestamp(),
+              source: 'openai_moderation'
+            });
+          } catch (logError) {
+            console.error('Firestore logging error:', logError);
+          }
+          
+          // Return early - Gemini API is NOT called for flagged requests
+          return res.status(200).json({
+            response: blockMessage,
+            source: 'openai_moderation'
+          });
+        }
+      }
+    } catch (openaiError) {
+      console.error('OpenAI Moderation API Error:', openaiError.message);
+      // Continue to fallback pattern matching if OpenAI moderation fails
+    }
+    
     // Check cache first
     const cacheKey = user_query.toLowerCase().trim();
     const cached = cache.get(cacheKey);
@@ -60,7 +106,7 @@ export default async function handler(req, res) {
     }
     
     // ========================================
-    // CRITICAL: MODERATION FIRST - Block bad requests BEFORE calling Gemini API
+    // CRITICAL: PATTERN-BASED MODERATION - Redundant fallback layer
     // ========================================
     
     // Simple content moderation - block obvious harmful content
