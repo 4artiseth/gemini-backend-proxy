@@ -1,6 +1,5 @@
 // generate.js - Safe free-tier backend with moderation, cache, and fallback
 import admin from 'firebase-admin';
-
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -8,13 +7,10 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount)
   });
 }
-
 const db = admin.firestore();
-
 // In-memory cache
 const cache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
-
 // Fallback prayers for rate limits
 const FALLBACK_PRAYERS = [
   "Om Shanti Shanti Shanti",
@@ -23,10 +19,8 @@ const FALLBACK_PRAYERS = [
   "Om Namah Shivaya",
   "Lokah Samastah Sukhino Bhavantu"
 ];
-
 // Fixed model name constant - gemini-2.5-flash-lite only
 const MODEL_NAME = 'gemini-2.5-flash-lite';
-
 export default async function handler(req, res) {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -50,136 +44,100 @@ export default async function handler(req, res) {
     
     // Check cache FIRST - cache hits don't create new Firestore documents
     const cacheKey = user_query.toLowerCase().trim();
-    const cached = cache.get(cacheKey);
-    
-    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    const cachedEntry = cache.get(cacheKey);
+    if (cachedEntry && (Date.now() - cachedEntry.timestamp < CACHE_TTL)) {
       return res.status(200).json({
-        response: cached.response,
-        source: 'cache',
-        cached_at: new Date(cached.timestamp).toISOString()
+        response: cachedEntry.response,
+        source: 'cache'
       });
     }
     
-    // ========================================
-    // MODERATION CHECKS - Block harmful content early
-    // ========================================
+    // Local pattern-based moderation
+    const query = user_query.toLowerCase();
+    const harmfulPatterns = [
+      /\b(bomb|explosive|weapon|kill|murder|suicide)\b/i,
+      /\b(hack|crack|steal|fraud|scam)\b/i,
+      /\b(drug|cocaine|heroin|meth)\b/i
+    ];
+    const isBlocked = harmfulPatterns.some(pattern => pattern.test(query));
     
-    let isBlocked = false;
-    let blockSource = '';
-    
-    // Check 1: OpenAI Moderation API
+    // OpenAI moderation with timeout
+    let openaiBlocked = false;
     try {
-      const moderationResponse = await fetch('https://api.openai.com/v1/moderations', {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      const openaiResult = await fetch('https://api.openai.com/v1/moderations', {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          input: user_query
-        })
+        body: JSON.stringify({ input: user_query }),
+        signal: controller.signal
       });
-      
-      if (moderationResponse.ok) {
-        const moderationData = await moderationResponse.json();
-        const isFlagged = moderationData.results?.[0]?.flagged;
-        
-        if (isFlagged) {
-          isBlocked = true;
-          blockSource = 'openai_moderation';
-        }
-      }
-    } catch (openaiError) {
-      console.error('OpenAI Moderation API Error:', openaiError.message);
-      // Continue to pattern matching if OpenAI fails
+      clearTimeout(timeoutId);
+      const openaiData = await openaiResult.json();
+      openaiBlocked = openaiData.results?.[0]?.flagged || false;
+    } catch (moderationError) {
+      console.error('OpenAI moderation failed:', moderationError.message);
     }
     
-    // Check 2: Pattern-based moderation (only if OpenAI didn't block)
-    if (!isBlocked) {
-      const harmfulPatterns = [
-        /\b(bomb|explosive|weapon|kill|murder|suicide)\b/i,
-        /\b(hack|crack|steal|fraud|scam)\b/i,
-        /\b(drug|cocaine|heroin|meth)\b/i
-      ];
-      
-      const isHarmful = harmfulPatterns.some(pattern => pattern.test(user_query));
-      
-      if (isHarmful) {
-        isBlocked = true;
-        blockSource = 'pattern_moderation';
-      }
-    }
-    
-    // If moderated/blocked: return early with ONE Firestore document (moderated: false)
-    if (isBlocked) {
-      const blockMessage = "I can't assist with that request. Let me offer you a peaceful thought instead: " + 
+    // If blocked by either check, log with moderated: false and return peaceful fallback
+    if (isBlocked || openaiBlocked) {
+      const blockMessage = "I can't assist with that request. Let me offer you a peaceful thought instead: " +
         FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
       
-      // SINGLE LOG POINT FOR BLOCKED REQUESTS: moderated FALSE, generated_prayer NULL
+      // LOG BLOCKED QUERY: moderated FALSE, generated_prayer NULL
       try {
         await db.collection('requests').add({
           user_query: user_query,
           response: blockMessage,
           generated_prayer: null,
           moderated: false,
-          block_source: blockSource,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          source: blockSource
+          source: 'blocked'
         });
       } catch (logError) {
         console.error('Firestore logging error:', logError);
       }
       
-      // Return early - DO NOT call Gemini API for blocked requests
       return res.status(200).json({
         response: blockMessage,
-        source: blockSource
+        source: 'blocked'
       });
     }
     
-    // ========================================
-    // Moderation passed - Call Gemini API
-    // ========================================
+    // Query passed moderation - proceed with Gemini API
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${GEMINI_API_KEY}`;
     
-    const prompt = `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 1-2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 350 characters, NO explanations, NO extra text, ONLY prayer. Examples: Om Aiṃ Sarasvatyai Namaḥ। Om Gaṇ Gaṇapataye Namaḥ। May your mind be sharp and your efforts rewarded. Om Shanti Shanti Shantiḥ. Om Durgāyai Namaḥ। Om Hanumate Namaḥ। May you find strength and courage to face any challenge. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
-    
-    const geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+    const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{
           parts: [{
-            text: prompt
+            text: `Generate a short, spiritual prayer or blessing based on this request: "${user_query}". Include Hindu mantras where appropriate. Keep it under 50 words.`
           }]
         }]
       })
     });
     
-    if (!geminiResponse.ok) {
-      const errorBody = await geminiResponse.text();
-      const errorDetail = `Gemini API error: ${geminiResponse.status} ${geminiResponse.statusText} - ${errorBody}`;
-      console.error('Gemini API Error Details:', errorDetail);
-      throw new Error(errorDetail);
+    if (!response.ok) {
+      throw new Error(`Gemini API error: ${response.status}`);
     }
     
-    const geminiData = await geminiResponse.json();
-    const generatedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    const data = await response.json();
+    const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+      FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
     
-    if (!generatedText) {
-      const errorDetail = 'No response from Gemini - ' + JSON.stringify(geminiData);
-      console.error('Gemini Response Error:', errorDetail);
-      throw new Error(errorDetail);
-    }
-    
-    // Cache the response
+    // Cache successful response
     cache.set(cacheKey, {
       response: generatedText,
       timestamp: Date.now()
     });
     
-    // SINGLE LOG POINT FOR SUCCESSFUL GENERATION: moderated TRUE, generated_prayer present
+    // LOG SUCCESSFUL PRAYER: moderated TRUE, generated_prayer has the prayer text
     try {
       await db.collection('requests').add({
         user_query: user_query,
@@ -207,10 +165,10 @@ export default async function handler(req, res) {
     };
     console.error('API Error Details:', JSON.stringify(errorDetail, null, 2));
     
-    // Fallback response (errors/rate-limits): moderated TRUE
+    // Fallback response for errors: moderated TRUE with fallback prayer
     const fallbackResponse = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
     
-    // SINGLE LOG POINT FOR ERROR FALLBACK: moderated TRUE (query passed moderation but Gemini failed)
+    // LOG ERROR FALLBACK: moderated TRUE, generated_prayer has fallback prayer
     try {
       await db.collection('requests').add({
         user_query: req.body?.user_query || 'unknown',
