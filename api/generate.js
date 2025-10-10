@@ -47,7 +47,7 @@ export default async function handler(req, res) {
     const cachedEntry = cache.get(cacheKey);
     if (cachedEntry && (Date.now() - cachedEntry.timestamp < CACHE_TTL)) {
       return res.status(200).json({
-        response: cachedEntry.response,
+        generated_prayer: cachedEntry.generated_prayer,
         source: 'cache'
       });
     }
@@ -117,7 +117,7 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         contents: [{
           parts: [{
-            text: `Generate a short, spiritual prayer or blessing based on this request: "${user_query}". Include Hindu mantras where appropriate. Keep it under 50 words.`
+            text: `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 350 characters, NO explanations, NO extra text, ONLY prayer.`
           }]
         }]
       })
@@ -133,15 +133,14 @@ export default async function handler(req, res) {
     
     // Cache successful response
     cache.set(cacheKey, {
-      response: generatedText,
+      generated_prayer: generatedText,
       timestamp: Date.now()
     });
     
-    // LOG SUCCESSFUL PRAYER: moderated TRUE, generated_prayer has the prayer text
+    // LOG SUCCESSFUL PRAYER: moderated TRUE, only generated_prayer field
     try {
       await db.collection('requests').add({
         user_query: user_query,
-        response: generatedText,
         generated_prayer: generatedText,
         moderated: true,
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
@@ -152,7 +151,7 @@ export default async function handler(req, res) {
     }
     
     return res.status(200).json({
-      response: generatedText,
+      generated_prayer: generatedText,
       source: 'gemini'
     });
     
@@ -172,7 +171,6 @@ export default async function handler(req, res) {
     try {
       await db.collection('requests').add({
         user_query: req.body?.user_query || 'unknown',
-        response: fallbackResponse,
         generated_prayer: fallbackResponse,
         moderated: true,
         error: JSON.stringify(errorDetail),
@@ -184,7 +182,7 @@ export default async function handler(req, res) {
     }
     
     return res.status(200).json({
-      response: fallbackResponse,
+      generated_prayer: fallbackResponse,
       source: 'fallback',
       note: 'Service temporarily limited, showing peaceful message'
     });
