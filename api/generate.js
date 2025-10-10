@@ -39,7 +39,7 @@ export default async function handler(req, res) {
   }
   
   try {
-    const { user_query, tone } = req.body;
+    const { user_query } = req.body;
     
     if (!user_query || typeof user_query !== 'string') {
       return res.status(400).json({ error: 'user_query is required and must be a string' });
@@ -48,162 +48,124 @@ export default async function handler(req, res) {
     // Check cache first
     const cacheKey = user_query.toLowerCase().trim();
     const cached = cache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-      return res.status(200).json({ 
-        safe: true, 
-        fallback: false, 
-        generatedPrayer: cached.response 
+    
+    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+      return res.status(200).json({
+        response: cached.response,
+        source: 'cache',
+        cached_at: new Date(cached.timestamp).toISOString()
       });
     }
     
-    // OpenAI moderation check
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: 'OpenAI API key not configured' });
+    // Simple content moderation - block obvious harmful content
+    const harmfulPatterns = [
+      /\b(bomb|explosive|weapon|kill|murder|suicide)\b/i,
+      /\b(hack|crack|steal|fraud|scam)\b/i,
+      /\b(drug|cocaine|heroin|meth)\b/i
+    ];
+    
+    const isHarmful = harmfulPatterns.some(pattern => pattern.test(user_query));
+    
+    if (isHarmful) {
+      const moderationResponse = "I can't assist with that request. Let me offer you a peaceful thought instead: " + 
+        FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
+      
+      // Log moderation to Firestore
+      try {
+        await db.collection('interactions').add({
+          user_query: user_query,
+          response: moderationResponse,
+          moderated: true,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          source: 'moderation'
+        });
+      } catch (logError) {
+        console.error('Firestore logging error:', logError);
+      }
+      
+      return res.status(200).json({
+        response: moderationResponse,
+        source: 'moderation'
+      });
     }
     
-    const moderationResponse = await fetch('https://api.openai.com/v1/moderations', {
+    // Prepare prompt for Gemini
+    const prompt = `Please provide a helpful, safe, and informative response to: "${user_query}"`;
+    
+    // Call Gemini API
+    const geminiResponse = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=' + process.env.GEMINI_API_KEY, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`
       },
-      body: JSON.stringify({ input: user_query })
+      body: JSON.stringify({
+        contents: [{
+          parts: [{
+            text: prompt
+          }]
+        }]
+      })
     });
     
-    if (!moderationResponse.ok) {
-      console.error('Moderation API error:', await moderationResponse.text());
-      return res.status(500).json({ error: 'Moderation check failed' });
-    }
-    
-    const moderation = await moderationResponse.json();
-    const isFlagged = moderation.results?.[0]?.flagged || false;
-    
-    // Write to Firestore after moderation
-    let generatedPrayer = null;
-    let isFallback = false;
-    
-    if (isFlagged) {
-      // Log flagged request to Firestore
-      await db.collection('requests').add({
-        user_query,
-        moderated: false,
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        generatedPrayer: null,
-        fallback: false,
-        tone: tone || null
-      });
-      
-      return res.status(400).json({ 
-        safe: false, 
-        error: 'Content policy violation detected' 
-      });
-    }
-    
-    // Call Gemini API
-    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'Gemini API key not configured' });
-    }
-    
-    const model = 'gemini-2.0-flash-exp';
-    
-    // Build prompt with tone if provided
-    const promptText = tone 
-      ? `Generate a prayer with ${tone} tone: ${user_query}` 
-      : `Generate a prayer: ${user_query}`;
-    
-    const geminiResponse = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: promptText }] }],
-          generationConfig: {
-            temperature: 0.7,
-            topK: 40,
-            topP: 0.95,
-            maxOutputTokens: 1024
-          }
-        })
-      }
-    );
-    
     if (!geminiResponse.ok) {
-      const errorData = await geminiResponse.text();
-      console.error('Gemini API error:', errorData);
-      
-      // Fallback to random prayer on rate limit or error
-      if (geminiResponse.status === 429 || geminiResponse.status >= 500) {
-        const fallbackPrayer = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
-        generatedPrayer = fallbackPrayer;
-        isFallback = true;
-        
-        // Log fallback request to Firestore
-        await db.collection('requests').add({
-          user_query,
-          moderated: true,
-          timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          generatedPrayer,
-          fallback: true,
-          tone: tone || null
-        });
-        
-        return res.status(200).json({ 
-          safe: true, 
-          fallback: true, 
-          generatedPrayer: fallbackPrayer 
-        });
-      }
-      
-      return res.status(geminiResponse.status).json({ 
-        error: 'Gemini API error', 
-        details: errorData 
-      });
+      throw new Error(`Gemini API error: ${geminiResponse.status}`);
     }
     
-    const data = await geminiResponse.json();
-    const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response generated';
-    generatedPrayer = responseText;
+    const geminiData = await geminiResponse.json();
+    const generatedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!generatedText) {
+      throw new Error('No response from Gemini');
+    }
     
     // Cache the response
     cache.set(cacheKey, {
-      response: responseText,
+      response: generatedText,
       timestamp: Date.now()
     });
     
-    // Clean old cache entries
-    if (cache.size > 100) {
-      const entries = Array.from(cache.entries());
-      const now = Date.now();
-      entries.forEach(([key, value]) => {
-        if (now - value.timestamp > CACHE_TTL) {
-          cache.delete(key);
-        }
+    // Log successful interaction to Firestore
+    try {
+      await db.collection('interactions').add({
+        user_query: user_query,
+        response: generatedText,
+        moderated: false,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        source: 'gemini'
       });
+    } catch (logError) {
+      console.error('Firestore logging error:', logError);
     }
     
-    // Log successful request to Firestore
-    await db.collection('requests').add({
-      user_query,
-      moderated: true,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      generatedPrayer,
-      fallback: false,
-      tone: tone || null
+    return res.status(200).json({
+      response: generatedText,
+      source: 'gemini'
     });
     
-    return res.status(200).json({ 
-      safe: true, 
-      fallback: false, 
-      generatedPrayer: responseText 
-    });
   } catch (error) {
-    console.error('Backend error:', error);
-    return res.status(500).json({ 
-      error: 'Internal server error', 
-      details: error.message 
+    console.error('API Error:', error);
+    
+    // Fallback response
+    const fallbackResponse = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
+    
+    // Log error to Firestore
+    try {
+      await db.collection('interactions').add({
+        user_query: req.body?.user_query || 'unknown',
+        response: fallbackResponse,
+        moderated: false,
+        error: error.message,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        source: 'fallback'
+      });
+    } catch (logError) {
+      console.error('Firestore logging error:', logError);
+    }
+    
+    return res.status(200).json({
+      response: fallbackResponse,
+      source: 'fallback',
+      note: 'Service temporarily limited, showing peaceful message'
     });
   }
 }
