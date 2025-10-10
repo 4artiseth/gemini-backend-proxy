@@ -36,7 +36,7 @@ export default async function handler(req, res) {
   }
   
   try {
-    const { user_query } = req.body;
+    const { user_query, name, email } = req.body;
     
     if (!user_query || typeof user_query !== 'string') {
       return res.status(400).json({ error: 'user_query is required and must be a string' });
@@ -87,13 +87,17 @@ export default async function handler(req, res) {
       const blockMessage = "I can't assist with that request. Let me offer you a peaceful thought instead: " +
         FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
       
-      // LOG BLOCKED QUERY: moderated FALSE, generated_prayer NULL
+      // LOG BLOCKED QUERY: All fields including name, email, moderated FALSE, generated_prayer NULL
       try {
         await db.collection('requests').add({
+          name: name || null,
+          email: email || null,
           user_query: user_query,
           response: blockMessage,
           generated_prayer: null,
           moderated: false,
+          status: 'pending',
+          movedToPublic: false,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
           source: 'blocked'
         });
@@ -137,12 +141,16 @@ export default async function handler(req, res) {
       timestamp: Date.now()
     });
     
-    // LOG SUCCESSFUL PRAYER: moderated TRUE, only generated_prayer field
+    // LOG SUCCESSFUL PRAYER: All fields including name, email, moderated TRUE
     try {
       await db.collection('requests').add({
+        name: name || null,
+        email: email || null,
         user_query: user_query,
         generated_prayer: generatedText,
         moderated: true,
+        status: 'pending',
+        movedToPublic: false,
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         source: 'gemini'
       });
@@ -167,12 +175,16 @@ export default async function handler(req, res) {
     // Fallback response for errors: moderated TRUE with fallback prayer
     const fallbackResponse = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
     
-    // LOG ERROR FALLBACK: moderated TRUE, generated_prayer has fallback prayer
+    // LOG ERROR FALLBACK: All fields including name, email, moderated TRUE, generated_prayer has fallback
     try {
       await db.collection('requests').add({
+        name: req.body?.name || null,
+        email: req.body?.email || null,
         user_query: req.body?.user_query || 'unknown',
         generated_prayer: fallbackResponse,
         moderated: true,
+        status: 'pending',
+        movedToPublic: false,
         error: JSON.stringify(errorDetail),
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         source: 'fallback'
