@@ -1,4 +1,4 @@
-// generate.js - Safe free-tier backend with moderation, cache, and fallback
+4// generate.js - Safe free-tier backend with moderation, cache, and fallback
 import admin from 'firebase-admin';
 
 // Initialize Firebase Admin SDK
@@ -8,7 +8,6 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount)
   });
 }
-
 const db = admin.firestore();
 
 // In-memory cache
@@ -23,6 +22,9 @@ const FALLBACK_PRAYERS = [
   "Om Namah Shivaya",
   "Lokah Samastah Sukhino Bhavantu"
 ];
+
+// Fixed model name constant - gemini-2.5-flash-lite only
+const MODEL_NAME = 'gemini-2.5-flash-lite';
 
 export default async function handler(req, res) {
   // CORS headers
@@ -101,10 +103,10 @@ export default async function handler(req, res) {
     // ========================================
     
     // Minimal, robust prompt for dumb models
-    const prompt = `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 1-2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 250 characters, NO explanations, NO extra text, ONLY prayer. Examples: Om Aiṃ Sarasvatyai Namaḥ। Om Gaṇ Gaṇapataye Namaḥ। May your mind be sharp and your efforts rewarded. Om Shanti Shanti Shantiḥ. Om Durgāyai Namaḥ। Om Hanumate Namaḥ। May you find strength and courage to face any challenge. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
+    const prompt = `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 1-2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 350 characters, NO explanations, NO extra text, ONLY prayer. Examples: Om Aiṃ Sarasvatyai Namaḥ। Om Gaṇ Gaṇapataye Namaḥ। May your mind be sharp and your efforts rewarded. Om Shanti Shanti Shantiḥ. Om Durgāyai Namaḥ। Om Hanumate Namaḥ। May you find strength and courage to face any challenge. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
     
-    // Call Gemini API with gemini-2.5-flash-lite
-    const geminiResponse = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=' + process.env.GEMINI_API_KEY, {
+    // Call Gemini API with fixed model constant
+    const geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
