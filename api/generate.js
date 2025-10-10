@@ -72,7 +72,7 @@ export default async function handler(req, res) {
       
       // Log moderation (blocked) to Firestore: moderated false, generated_prayer null
       try {
-        await db.collection('interactions').add({
+        await db.collection('requests').add({
           user_query: user_query,
           response: moderationResponse,
           generated_prayer: null,
@@ -132,7 +132,7 @@ export default async function handler(req, res) {
     
     // Log successful generation to Firestore: approved/generated prayer -> moderated true
     try {
-      await db.collection('interactions').add({
+      await db.collection('requests').add({
         user_query: user_query,
         response: generatedText,
         generated_prayer: generatedText,
@@ -163,7 +163,7 @@ export default async function handler(req, res) {
     
     // Log error fallback to Firestore: moderated true, generated_prayer present as fallback, with full error details
     try {
-      await db.collection('interactions').add({
+      await db.collection('requests').add({
         user_query: req.body?.user_query || 'unknown',
         response: fallbackResponse,
         generated_prayer: fallbackResponse,
