@@ -28,17 +28,21 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { prompt } = req.body;
+    const { user_query, tone } = req.body;
 
-    if (!prompt || typeof prompt !== 'string') {
-      return res.status(400).json({ error: 'Prompt is required and must be a string' });
+    if (!user_query || typeof user_query !== 'string') {
+      return res.status(400).json({ error: 'user_query is required and must be a string' });
     }
 
     // Check cache first
-    const cacheKey = prompt.toLowerCase().trim();
+    const cacheKey = user_query.toLowerCase().trim();
     const cached = cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-      return res.status(200).json({ text: cached.response, cached: true });
+      return res.status(200).json({ 
+        safe: true, 
+        fallback: false, 
+        generatedPrayer: cached.response 
+      });
     }
 
     // OpenAI moderation check
@@ -53,7 +57,7 @@ export default async function handler(req, res) {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${OPENAI_API_KEY}`
       },
-      body: JSON.stringify({ input: prompt })
+      body: JSON.stringify({ input: user_query })
     });
 
     if (!moderationResponse.ok) {
@@ -63,7 +67,10 @@ export default async function handler(req, res) {
 
     const moderation = await moderationResponse.json();
     if (moderation.results?.[0]?.flagged) {
-      return res.status(400).json({ error: 'Content policy violation detected' });
+      return res.status(400).json({ 
+        safe: false, 
+        error: 'Content policy violation detected' 
+      });
     }
 
     // Call Gemini API
@@ -73,13 +80,19 @@ export default async function handler(req, res) {
     }
 
     const model = 'gemini-2.0-flash-exp';
+    
+    // Build prompt with tone if provided
+    const promptText = tone 
+      ? `Generate a prayer with ${tone} tone: ${user_query}` 
+      : `Generate a prayer: ${user_query}`;
+
     const geminiResponse = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
+          contents: [{ parts: [{ text: promptText }] }],
           generationConfig: {
             temperature: 0.7,
             topK: 40,
@@ -96,8 +109,12 @@ export default async function handler(req, res) {
       
       // Fallback to random prayer on rate limit or error
       if (geminiResponse.status === 429 || geminiResponse.status >= 500) {
-        const fallback = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
-        return res.status(200).json({ text: fallback, fallback: true });
+        const fallbackPrayer = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
+        return res.status(200).json({ 
+          safe: true, 
+          fallback: true, 
+          generatedPrayer: fallbackPrayer 
+        });
       }
       
       return res.status(geminiResponse.status).json({ 
@@ -126,8 +143,11 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(200).json({ text: responseText });
-
+    return res.status(200).json({ 
+      safe: true, 
+      fallback: false, 
+      generatedPrayer: responseText 
+    });
   } catch (error) {
     console.error('Backend error:', error);
     return res.status(500).json({ 
