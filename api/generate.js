@@ -1,5 +1,6 @@
 // generate.js - Safe free-tier backend with moderation, cache, and fallback
 import admin from 'firebase-admin';
+
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -7,10 +8,13 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount)
   });
 }
+
 const db = admin.firestore();
+
 // In-memory cache
 const cache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
+
 // Fallback prayers for rate limits
 const FALLBACK_PRAYERS = [
   "Om Shanti Shanti Shanti",
@@ -19,8 +23,10 @@ const FALLBACK_PRAYERS = [
   "Om Namah Shivaya",
   "Lokah Samastah Sukhino Bhavantu"
 ];
+
 // Fixed model name constant - gemini-2.5-flash-lite only
 const MODEL_NAME = 'gemini-2.5-flash-lite';
+
 export default async function handler(req, res) {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -42,10 +48,26 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'user_query is required and must be a string' });
     }
     
+    // Check cache FIRST - cache hits don't create new Firestore documents
+    const cacheKey = user_query.toLowerCase().trim();
+    const cached = cache.get(cacheKey);
+    
+    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+      return res.status(200).json({
+        response: cached.response,
+        source: 'cache',
+        cached_at: new Date(cached.timestamp).toISOString()
+      });
+    }
+    
     // ========================================
-    // OPENAI MODERATION API - First layer of defense
+    // MODERATION CHECKS - Block harmful content early
     // ========================================
     
+    let isBlocked = false;
+    let blockSource = '';
+    
+    // Check 1: OpenAI Moderation API
     try {
       const moderationResponse = await fetch('https://api.openai.com/v1/moderations', {
         method: 'POST',
@@ -63,95 +85,64 @@ export default async function handler(req, res) {
         const isFlagged = moderationData.results?.[0]?.flagged;
         
         if (isFlagged) {
-          const blockMessage = "I can't assist with that request. Let me offer you a peaceful thought instead: " + 
-            FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
-          
-          // Log OpenAI moderation block to Firestore: moderated false
-          try {
-            await db.collection('requests').add({
-              user_query: user_query,
-              response: blockMessage,
-              generated_prayer: null,
-              moderated: false,
-              openai_flagged: true,
-              timestamp: admin.firestore.FieldValue.serverTimestamp(),
-              source: 'openai_moderation'
-            });
-          } catch (logError) {
-            console.error('Firestore logging error:', logError);
-          }
-          
-          // Return early - Gemini API is NOT called for flagged requests
-          return res.status(200).json({
-            response: blockMessage,
-            source: 'openai_moderation'
-          });
+          isBlocked = true;
+          blockSource = 'openai_moderation';
         }
       }
     } catch (openaiError) {
       console.error('OpenAI Moderation API Error:', openaiError.message);
-      // Continue to fallback pattern matching if OpenAI moderation fails
+      // Continue to pattern matching if OpenAI fails
     }
     
-    // Check cache first
-    const cacheKey = user_query.toLowerCase().trim();
-    const cached = cache.get(cacheKey);
-    
-    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
-      return res.status(200).json({
-        response: cached.response,
-        source: 'cache',
-        cached_at: new Date(cached.timestamp).toISOString()
-      });
+    // Check 2: Pattern-based moderation (only if OpenAI didn't block)
+    if (!isBlocked) {
+      const harmfulPatterns = [
+        /\b(bomb|explosive|weapon|kill|murder|suicide)\b/i,
+        /\b(hack|crack|steal|fraud|scam)\b/i,
+        /\b(drug|cocaine|heroin|meth)\b/i
+      ];
+      
+      const isHarmful = harmfulPatterns.some(pattern => pattern.test(user_query));
+      
+      if (isHarmful) {
+        isBlocked = true;
+        blockSource = 'pattern_moderation';
+      }
     }
     
-    // ========================================
-    // CRITICAL: PATTERN-BASED MODERATION - Redundant fallback layer
-    // ========================================
-    
-    // Simple content moderation - block obvious harmful content
-    const harmfulPatterns = [
-      /\b(bomb|explosive|weapon|kill|murder|suicide)\b/i,
-      /\b(hack|crack|steal|fraud|scam)\b/i,
-      /\b(drug|cocaine|heroin|meth)\b/i
-    ];
-    
-    const isHarmful = harmfulPatterns.some(pattern => pattern.test(user_query));
-    
-    // If moderation fails, DO NOT call Gemini - return immediately
-    if (isHarmful) {
-      const moderationResponse = "I can't assist with that request. Let me offer you a peaceful thought instead: " + 
+    // If moderated/blocked: return early with ONE Firestore document (moderated: false)
+    if (isBlocked) {
+      const blockMessage = "I can't assist with that request. Let me offer you a peaceful thought instead: " + 
         FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
       
-      // Log moderation (blocked) to Firestore: moderated false, generated_prayer null
+      // SINGLE LOG POINT FOR BLOCKED REQUESTS: moderated FALSE, generated_prayer NULL
       try {
         await db.collection('requests').add({
           user_query: user_query,
-          response: moderationResponse,
+          response: blockMessage,
           generated_prayer: null,
           moderated: false,
+          block_source: blockSource,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          source: 'moderation'
+          source: blockSource
         });
       } catch (logError) {
         console.error('Firestore logging error:', logError);
       }
       
-      // Return early - Gemini API is NOT called for bad requests
+      // Return early - DO NOT call Gemini API for blocked requests
       return res.status(200).json({
-        response: moderationResponse,
-        source: 'moderation'
+        response: blockMessage,
+        source: blockSource
       });
     }
     
     // ========================================
-    // Moderation passed - NOW safe to call Gemini API
+    // Moderation passed - Call Gemini API
     // ========================================
     
-    // Minimal, robust prompt for dumb models
     const prompt = `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 1-2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 350 characters, NO explanations, NO extra text, ONLY prayer. Examples: Om Aiṃ Sarasvatyai Namaḥ। Om Gaṇ Gaṇapataye Namaḥ। May your mind be sharp and your efforts rewarded. Om Shanti Shanti Shantiḥ. Om Durgāyai Namaḥ। Om Hanumate Namaḥ। May you find strength and courage to face any challenge. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
     
-    // Call Gemini API with fixed model constant
     const geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
       method: 'POST',
       headers: {
@@ -188,7 +179,7 @@ export default async function handler(req, res) {
       timestamp: Date.now()
     });
     
-    // Log successful generation to Firestore: approved/generated prayer -> moderated true
+    // SINGLE LOG POINT FOR SUCCESSFUL GENERATION: moderated TRUE, generated_prayer present
     try {
       await db.collection('requests').add({
         user_query: user_query,
@@ -216,10 +207,10 @@ export default async function handler(req, res) {
     };
     console.error('API Error Details:', JSON.stringify(errorDetail, null, 2));
     
-    // Fallback response (errors/rate-limits): still moderated true
+    // Fallback response (errors/rate-limits): moderated TRUE
     const fallbackResponse = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
     
-    // Log error fallback to Firestore: moderated true, generated_prayer present as fallback, with full error details
+    // SINGLE LOG POINT FOR ERROR FALLBACK: moderated TRUE (query passed moderation but Gemini failed)
     try {
       await db.collection('requests').add({
         user_query: req.body?.user_query || 'unknown',
