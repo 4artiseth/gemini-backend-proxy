@@ -65,12 +65,13 @@ export default async function handler(req, res) {
       const moderationResponse = "I can't assist with that request. Let me offer you a peaceful thought instead: " + 
         FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
       
-      // Log moderation to Firestore
+      // Log moderation (blocked) to Firestore: moderated false, generated_prayer null
       try {
         await db.collection('interactions').add({
           user_query: user_query,
           response: moderationResponse,
-          moderated: true,
+          generated_prayer: null,
+          moderated: false,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
           source: 'moderation'
         });
@@ -119,12 +120,13 @@ export default async function handler(req, res) {
       timestamp: Date.now()
     });
     
-    // Log successful interaction to Firestore
+    // Log successful generation to Firestore: approved/generated prayer -> moderated true
     try {
       await db.collection('interactions').add({
         user_query: user_query,
         response: generatedText,
-        moderated: false,
+        generated_prayer: generatedText,
+        moderated: true,
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         source: 'gemini'
       });
@@ -140,15 +142,16 @@ export default async function handler(req, res) {
   } catch (error) {
     console.error('API Error:', error);
     
-    // Fallback response
+    // Fallback response (errors/rate-limits): still moderated true
     const fallbackResponse = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
     
-    // Log error to Firestore
+    // Log error fallback to Firestore: moderated true, generated_prayer present as fallback
     try {
       await db.collection('interactions').add({
         user_query: req.body?.user_query || 'unknown',
         response: fallbackResponse,
-        moderated: false,
+        generated_prayer: fallbackResponse,
+        moderated: true,
         error: error.message,
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         source: 'fallback'
