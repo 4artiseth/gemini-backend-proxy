@@ -103,8 +103,7 @@ export default async function handler(req, res) {
     // ========================================
     
     // Minimal, robust prompt for dumb models
-    const prompt = `Create a short Hindu prayer linked to the user's request. Use 2–3 Sanskrit mantras with "।" and then 1–2 English blessing sentences. Keep it under 500 chars, poetic but direct no explanations.
-Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
+    const prompt = `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 1-2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 350 characters, NO explanations, NO extra text, ONLY prayer. Examples: Om Aiṃ Sarasvatyai Namaḥ। Om Gaṇ Gaṇapataye Namaḥ। May your mind be sharp and your efforts rewarded. Om Shanti Shanti Shantiḥ. Om Durgāyai Namaḥ। Om Hanumate Namaḥ। May you find strength and courage to face any challenge. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
     
     // Call Gemini API with fixed model constant
     const geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
