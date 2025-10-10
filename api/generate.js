@@ -1,5 +1,6 @@
 // generate.js - Safe free-tier backend with moderation, cache, and fallback
 import admin from 'firebase-admin';
+
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -7,10 +8,13 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount)
   });
 }
+
 const db = admin.firestore();
+
 // In-memory cache
 const cache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
+
 // Fallback prayers for rate limits
 const FALLBACK_PRAYERS = [
   "Om Shanti Shanti Shanti",
@@ -19,6 +23,7 @@ const FALLBACK_PRAYERS = [
   "Om Namah Shivaya",
   "Lokah Samastah Sukhino Bhavantu"
 ];
+
 export default async function handler(req, res) {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -88,8 +93,8 @@ export default async function handler(req, res) {
     // Minimal, robust prompt for dumb models
     const prompt = `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 1-2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 250 characters, NO explanations, NO extra text, ONLY prayer. Examples: Om Aiṃ Sarasvatyai Namaḥ। Om Gaṇ Gaṇapataye Namaḥ। May your mind be sharp and your efforts rewarded. Om Shanti Shanti Shantiḥ. Om Durgāyai Namaḥ। Om Hanumate Namaḥ। May you find strength and courage to face any challenge. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
     
-    // Call Gemini API
-    const geminiResponse = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=' + process.env.GEMINI_API_KEY, {
+    // Call Gemini API with gemini-2.5-flash-lite
+    const geminiResponse = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=' + process.env.GEMINI_API_KEY, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -104,14 +109,19 @@ export default async function handler(req, res) {
     });
     
     if (!geminiResponse.ok) {
-      throw new Error(`Gemini API error: ${geminiResponse.status}`);
+      const errorBody = await geminiResponse.text();
+      const errorDetail = `Gemini API error: ${geminiResponse.status} ${geminiResponse.statusText} - ${errorBody}`;
+      console.error('Gemini API Error Details:', errorDetail);
+      throw new Error(errorDetail);
     }
     
     const geminiData = await geminiResponse.json();
     const generatedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
     
     if (!generatedText) {
-      throw new Error('No response from Gemini');
+      const errorDetail = 'No response from Gemini - ' + JSON.stringify(geminiData);
+      console.error('Gemini Response Error:', errorDetail);
+      throw new Error(errorDetail);
     }
     
     // Cache the response
@@ -140,19 +150,25 @@ export default async function handler(req, res) {
     });
     
   } catch (error) {
-    console.error('API Error:', error);
+    // Enhanced error logging for troubleshooting
+    const errorDetail = {
+      message: error.message,
+      stack: error.stack,
+      name: error.name
+    };
+    console.error('API Error Details:', JSON.stringify(errorDetail, null, 2));
     
     // Fallback response (errors/rate-limits): still moderated true
     const fallbackResponse = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
     
-    // Log error fallback to Firestore: moderated true, generated_prayer present as fallback
+    // Log error fallback to Firestore: moderated true, generated_prayer present as fallback, with full error details
     try {
       await db.collection('interactions').add({
         user_query: req.body?.user_query || 'unknown',
         response: fallbackResponse,
         generated_prayer: fallbackResponse,
         moderated: true,
-        error: error.message,
+        error: JSON.stringify(errorDetail),
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         source: 'fallback'
       });
