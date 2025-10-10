@@ -1,6 +1,5 @@
 // generate.js - Safe free-tier backend with moderation, cache, and fallback
 import admin from 'firebase-admin';
-
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -8,13 +7,10 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount)
   });
 }
-
 const db = admin.firestore();
-
 // In-memory cache
 const cache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
-
 // Fallback prayers for rate limits
 const FALLBACK_PRAYERS = [
   "Om Shanti Shanti Shanti",
@@ -23,7 +19,6 @@ const FALLBACK_PRAYERS = [
   "Om Namah Shivaya",
   "Lokah Samastah Sukhino Bhavantu"
 ];
-
 export default async function handler(req, res) {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -89,8 +84,8 @@ export default async function handler(req, res) {
       });
     }
     
-    // Prepare prompt for Gemini
-    const prompt = `Please provide a helpful, safe, and informative response to: "${user_query}"`;
+    // Minimal, robust prompt for dumb models
+    const prompt = `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 1-2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 250 characters, NO explanations, NO extra text, ONLY prayer. Examples: Om Aiṃ Sarasvatyai Namaḥ। Om Gaṇ Gaṇapataye Namaḥ। May your mind be sharp and your efforts rewarded. Om Shanti Shanti Shantiḥ. Om Durgāyai Namaḥ। Om Hanumate Namaḥ। May you find strength and courage to face any challenge. Om Shanti Shanti Shantiḥ. User Request: "${user_query}"`;
     
     // Call Gemini API
     const geminiResponse = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=' + process.env.GEMINI_API_KEY, {
