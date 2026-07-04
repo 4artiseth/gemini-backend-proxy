@@ -1,181 +1,323 @@
-// generate.js - Safe free-tier backend with moderation, cache, and fallback
+// generate.js - OpenAI backend with moderation, cache, rate limiting, and fallback
 import admin from 'firebase-admin';
-// Initialize Firebase Admin SDK
+import crypto from 'crypto';
+
 if (!admin.apps.length) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+    credential: admin.credential.cert(serviceAccount),
   });
 }
+
 const db = admin.firestore();
-// In-memory cache
+
 const cache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
-// Fallback prayers for rate limits
+const FREE_PRAYER_DAILY_LIMIT = 3;
+const MODEL_NAME = 'gpt-5-nano';
+
 const FALLBACK_PRAYERS = [
-  "Om Shanti Shanti Shanti",
-  "May peace prevail on earth",
-  "Let there be light and wisdom",
-  "Om Namah Shivaya",
-  "Lokah Samastah Sukhino Bhavantu"
+  'Om Shanti Shanti Shanti',
+  'May peace prevail on earth',
+  'Let there be light and wisdom',
+  'Om Namah Shivaya',
+  'Lokah Samastah Sukhino Bhavantu',
 ];
-// Fixed model name constant - gemini-2.5-flash-lite only
-const MODEL_NAME = 'gemini-2.5-flash-lite';
+
+const PRAYER_SYSTEM_PROMPT =
+  'Pandit composing one prayer paragraph: 1-2 Sanskrit mantras (transliterated, diacritics), 1-2 English blessing sentences for the request, end "Om Shanti Shanti Shantiḥ." One flowing paragraph, no headings/labels/commentary, under 350 chars.';
+
+const PRAYER_USER_PROMPT = (name, userQuery) =>
+  `Request from ${name}: "${userQuery}"
+
+Format: [1-2 theme mantras]. [1-2 compassionate English sentences for their situation]. Om Shanti Shanti Shantiḥ.
+
+"Om Hrīm Śrīm Klīm Parameshwari Durgaayai Namaḥ Om Santāna Gopāla Om Dhanvantaraye. May sister's delivery be smooth and safe, baby arrive healthy, and mother-child both thrive beautifully. Om Shanti Shanti Shantiḥ."
+
+"Om Namo Bhagavate Vāsudevāya, Om Dum Durgāyai Namaḥ. Bless the devotee with meaningful companionship, genuine connections, and inner peace. May loneliness dissolve into belonging. Om Shanti Shanti Shantiḥ."
+
+Output prayer text only.`;
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function hashIp(ip) {
+  return crypto.createHash('sha256').update(ip || 'unknown').digest('hex').slice(0, 32);
+}
+
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.length > 0) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.headers['x-real-ip'] || req.socket?.remoteAddress || 'unknown';
+}
+
+async function verifyAuth(req) {
+  const authHeader = req.headers.authorization || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  const token = authHeader.slice('Bearer '.length).trim();
+  if (!token) {
+    return null;
+  }
+  try {
+    return await admin.auth().verifyIdToken(token);
+  } catch {
+    return null;
+  }
+}
+
+async function isUserPro(uid) {
+  const snap = await db
+    .collection('users')
+    .doc(uid)
+    .collection('entitlements')
+    .doc('status')
+    .get();
+  return snap.exists && snap.data().isPro === true;
+}
+
+async function checkAndIncrementPrayerUsage(userDocId, uidForProCheck) {
+  if (uidForProCheck && (await isUserPro(uidForProCheck))) {
+    return { ok: true, remaining: -1, isPro: true };
+  }
+
+  const today = todayKey();
+  const ref = db.collection('users').doc(userDocId).collection('usage').doc('status');
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.exists ? snap.data() : {};
+    const prayerDate = data.prayerDate || '';
+    let count = data.prayerCountToday || 0;
+
+    if (prayerDate !== today) {
+      count = 0;
+    }
+
+    if (count >= FREE_PRAYER_DAILY_LIMIT) {
+      return { ok: false, remaining: 0, isPro: false };
+    }
+
+    tx.set(
+      ref,
+      {
+        prayerCountToday: count + 1,
+        prayerDate: today,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return {
+      ok: true,
+      remaining: FREE_PRAYER_DAILY_LIMIT - (count + 1),
+      isPro: false,
+    };
+  });
+}
+
+async function callOpenAI(name, userQuery) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error('Missing OPENAI_API_KEY environment variable');
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: MODEL_NAME,
+        messages: [
+          { role: 'system', content: PRAYER_SYSTEM_PROMPT },
+          { role: 'user', content: PRAYER_USER_PROMPT(name, userQuery) },
+        ],
+        max_tokens: 200,
+        temperature: 0.7,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`OpenAI API error: ${response.status} ${errText}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content?.trim();
+    if (!content) {
+      throw new Error('OpenAI returned empty content');
+    }
+    return content;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function randomFallback() {
+  return FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
+}
+
 export default async function handler(req, res) {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
-  
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
-  
+
   try {
-    const { user_query, name, email } = req.body;
-    
+    const { user_query, name, email } = req.body || {};
+    const sanitizedName = (name || 'Friend').toString().trim().slice(0, 64) || 'Friend';
+
     if (!user_query || typeof user_query !== 'string') {
       return res.status(400).json({ error: 'user_query is required and must be a string' });
     }
-    
-    // Check cache FIRST - cache hits don't create new Firestore documents
-    const cacheKey = user_query.toLowerCase().trim();
+
+    const trimmedQuery = user_query.trim();
+    if (trimmedQuery.length < 3) {
+      return res.status(400).json({ error: 'user_query too short' });
+    }
+    if (trimmedQuery.length > 200) {
+      return res.status(400).json({ error: 'user_query too long' });
+    }
+
+    const authUser = await verifyAuth(req);
+    const rateLimitDocId = authUser?.uid || `ip_${hashIp(getClientIp(req))}`;
+
+    const cacheKey = trimmedQuery.toLowerCase();
     const cachedEntry = cache.get(cacheKey);
-    if (cachedEntry && (Date.now() - cachedEntry.timestamp < CACHE_TTL)) {
+    if (cachedEntry && Date.now() - cachedEntry.timestamp < CACHE_TTL) {
       return res.status(200).json({
         generated_prayer: cachedEntry.generated_prayer,
-        source: 'cache'
+        source: 'cache',
       });
     }
-    
-    // Local pattern-based moderation
-    const query = user_query.toLowerCase();
+
+    const query = trimmedQuery.toLowerCase();
     const harmfulPatterns = [
       /\b(bomb|explosive|weapon|kill|murder|suicide)\b/i,
       /\b(hack|crack|steal|fraud|scam)\b/i,
-      /\b(drug|cocaine|heroin|meth)\b/i
+      /\b(drug|cocaine|heroin|meth)\b/i,
     ];
-    const isBlocked = harmfulPatterns.some(pattern => pattern.test(query));
-    
-    // OpenAI moderation with timeout
+    const isBlocked = harmfulPatterns.some((pattern) => pattern.test(query));
+
     let openaiBlocked = false;
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
-      const openaiResult = await fetch('https://api.openai.com/v1/moderations', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ input: user_query }),
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      const openaiData = await openaiResult.json();
-      openaiBlocked = openaiData.results?.[0]?.flagged || false;
-    } catch (moderationError) {
-      console.error('OpenAI moderation failed:', moderationError.message);
+    if (process.env.OPENAI_API_KEY) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        const openaiResult = await fetch('https://api.openai.com/v1/moderations', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ input: trimmedQuery }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        const openaiData = await openaiResult.json();
+        openaiBlocked = openaiData.results?.[0]?.flagged || false;
+      } catch (moderationError) {
+        console.error('OpenAI moderation failed:', moderationError.message);
+      }
     }
-    
-    // If blocked by either check, log with moderated: false and return peaceful fallback
+
     if (isBlocked || openaiBlocked) {
-      const blockMessage = "I can't assist with that request. Let me offer you a peaceful thought instead: " +
-        FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
-      
-      // LOG BLOCKED QUERY: All fields including name, email, moderated FALSE, generated_prayer NULL
+      const blockMessage =
+        "I can't assist with that request. Let me offer you a peaceful thought instead: " +
+        randomFallback();
+
       try {
         await db.collection('requests').add({
-          name: name || null,
+          name: sanitizedName || null,
           email: email || null,
-          user_query: user_query,
+          user_query: trimmedQuery,
           response: blockMessage,
           generated_prayer: null,
           moderated: false,
           status: 'pending',
           movedToPublic: false,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          source: 'blocked'
+          source: 'blocked',
+          uid: authUser?.uid || null,
         });
       } catch (logError) {
         console.error('Firestore logging error:', logError);
       }
-      
+
       return res.status(200).json({
         response: blockMessage,
-        source: 'blocked'
+        source: 'blocked',
       });
     }
-    
-    // Query passed moderation - proceed with Gemini API
-    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${GEMINI_API_KEY}`;
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [{
-            text: `Generate a short Sanskrit prayer only. Format: Om [mantra]। Om [mantra]। [English blessing]. Om Shanti Shanti Shantiḥ. Rules: 2 Sanskrit mantras, diacritics ok, dots (।) after each, 2 sentence English blessing, end with "Om Shanti Shanti Shantiḥ.", UNDER 350 characters, NO explanations, NO extra text, ONLY prayer.`
-          }]
-        }]
-      })
-    });
-    
-    if (!response.ok) {
-      throw new Error(`Gemini API error: ${response.status}`);
+
+    const usage = await checkAndIncrementPrayerUsage(rateLimitDocId, authUser?.uid || null);
+    if (!usage.ok) {
+      return res.status(429).json({
+        error: 'prayer_limit_reached',
+        message:
+          'You have reached your free daily prayer limit. Upgrade to Pro for unlimited prayers.',
+        remaining: 0,
+      });
     }
-    
-    const data = await response.json();
-    const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
-      FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
-    
-    // Cache successful response
+
+    const generatedText = await callOpenAI(sanitizedName, trimmedQuery);
+
     cache.set(cacheKey, {
       generated_prayer: generatedText,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     });
-    
-    // LOG SUCCESSFUL PRAYER: All fields including name, email, moderated TRUE
+
     try {
       await db.collection('requests').add({
-        name: name || null,
+        name: sanitizedName || null,
         email: email || null,
-        user_query: user_query,
+        user_query: trimmedQuery,
         generated_prayer: generatedText,
         moderated: true,
         status: 'pending',
         movedToPublic: false,
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        source: 'gemini'
+        source: 'openai',
+        uid: authUser?.uid || null,
+        remaining_prayers: usage.remaining,
       });
     } catch (logError) {
       console.error('Firestore logging error:', logError);
     }
-    
+
     return res.status(200).json({
       generated_prayer: generatedText,
-      source: 'gemini'
+      source: 'openai',
+      remaining_prayers: usage.remaining,
     });
-    
   } catch (error) {
-    // Enhanced error logging for troubleshooting
     const errorDetail = {
       message: error.message,
       stack: error.stack,
-      name: error.name
+      name: error.name,
     };
     console.error('API Error Details:', JSON.stringify(errorDetail, null, 2));
-    
-    // Fallback response for errors: moderated TRUE with fallback prayer
-    const fallbackResponse = FALLBACK_PRAYERS[Math.floor(Math.random() * FALLBACK_PRAYERS.length)];
-    
-    // LOG ERROR FALLBACK: All fields including name, email, moderated TRUE, generated_prayer has fallback
+
+    const fallbackResponse = randomFallback();
+
     try {
       await db.collection('requests').add({
         name: req.body?.name || null,
@@ -187,16 +329,16 @@ export default async function handler(req, res) {
         movedToPublic: false,
         error: JSON.stringify(errorDetail),
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        source: 'fallback'
+        source: 'fallback',
       });
     } catch (logError) {
       console.error('Firestore logging error:', logError);
     }
-    
+
     return res.status(200).json({
       generated_prayer: fallbackResponse,
       source: 'fallback',
-      note: 'Service temporarily limited, showing peaceful message'
+      note: 'Service temporarily limited, showing peaceful message',
     });
   }
 }
