@@ -142,7 +142,9 @@ async function callOpenAI(name, userQuery) {
           { role: 'system', content: PRAYER_SYSTEM_PROMPT },
           { role: 'user', content: PRAYER_USER_PROMPT(name, userQuery) },
         ],
-       max_completion_tokens: 200,
+        // gpt-5-nano is a reasoning model: low token budgets produce empty content.
+        reasoning_effort: 'low',
+        max_completion_tokens: 2048,
       }),
       signal: controller.signal,
     });
