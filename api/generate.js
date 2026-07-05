@@ -2,12 +2,85 @@
 import admin from 'firebase-admin';
 import crypto from 'crypto';
 
-if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+function parseFirebaseServiceAccount() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw || !raw.trim()) {
+    throw new Error(
+      'FIREBASE_SERVICE_ACCOUNT is not set. In Vercel: Project Settings → Environment Variables → add FIREBASE_SERVICE_ACCOUNT containing the full Firebase service-account JSON as a single line.'
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `FIREBASE_SERVICE_ACCOUNT is not valid JSON (${err.message}). Paste the entire downloaded service-account JSON minified to one line. Do not wrap the value in extra quotes.`
+    );
+  }
+
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (err) {
+      throw new Error(
+        `FIREBASE_SERVICE_ACCOUNT appears double-encoded (${err.message}). Store the JSON object directly, not a quoted JSON string.`
+      );
+    }
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(
+      'FIREBASE_SERVICE_ACCOUNT must be a JSON object with project_id, private_key, and client_email.'
+    );
+  }
+
+  const missing = ['project_id', 'private_key', 'client_email'].filter(
+    (key) => typeof parsed[key] !== 'string' || !parsed[key].trim()
+  );
+  if (missing.length > 0) {
+    throw new Error(
+      `FIREBASE_SERVICE_ACCOUNT is missing or has empty fields: ${missing.join(', ')}.`
+    );
+  }
+
+  if (parsed.private_key.includes('\\n')) {
+    parsed = { ...parsed, private_key: parsed.private_key.replace(/\\n/g, '\n') };
+  }
+
+  return parsed;
 }
+
+function initializeFirebaseAdmin() {
+  if (admin.apps.length) {
+    return;
+  }
+
+  const serviceAccount = parseFirebaseServiceAccount();
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+  } catch (err) {
+    throw new Error(
+      `Firebase Admin failed to initialize from FIREBASE_SERVICE_ACCOUNT (${err.message}). Verify project_id, client_email, and private_key are copied exactly from the downloaded JSON.`
+    );
+  }
+}
+
+function firestoreHint(error) {
+  const message = error?.message || String(error);
+  if (
+    /invalid json|credential|private_key|project_id|unauthenticated|permission denied/i.test(
+      message
+    )
+  ) {
+    return `${message} — check FIREBASE_SERVICE_ACCOUNT in Vercel (valid single-line JSON, literal \\n in private_key, no extra wrapping quotes).`;
+  }
+  return message;
+}
+
+initializeFirebaseAdmin();
 
 const db = admin.firestore();
 
@@ -154,7 +227,9 @@ async function callOpenAI(name, userQuery) {
       throw new Error(`OpenAI API error: ${response.status} ${errText}`);
     }
 
-    const data = await response.json();
+    const data = await response.json().catch((err) => {
+      throw new Error(`OpenAI returned non-JSON response (${err.message})`);
+    });
     const content = data.choices?.[0]?.message?.content?.trim();
     if (!content) {
       throw new Error('OpenAI returned empty content');
@@ -233,7 +308,9 @@ export default async function handler(req, res) {
           signal: controller.signal,
         });
         clearTimeout(timeoutId);
-        const openaiData = await openaiResult.json();
+        const openaiData = await openaiResult.json().catch((err) => {
+          throw new Error(`OpenAI moderation returned non-JSON (${err.message})`);
+        });
         openaiBlocked = openaiData.results?.[0]?.flagged || false;
       } catch (moderationError) {
         console.error('OpenAI moderation failed:', moderationError.message);
@@ -260,7 +337,7 @@ export default async function handler(req, res) {
           uid: authUser?.uid || null,
         });
       } catch (logError) {
-        console.error('Firestore logging error:', logError);
+        console.error('Firestore logging error:', firestoreHint(logError));
       }
 
       return res.status(200).json({
@@ -301,7 +378,7 @@ export default async function handler(req, res) {
         remaining_prayers: usage.remaining,
       });
     } catch (logError) {
-      console.error('Firestore logging error:', logError);
+        console.error('Firestore logging error:', firestoreHint(logError));
     }
 
     return res.status(200).json({
@@ -311,7 +388,7 @@ export default async function handler(req, res) {
     });
   } catch (error) {
     const errorDetail = {
-      message: error.message,
+      message: firestoreHint(error),
       stack: error.stack,
       name: error.name,
     };
@@ -333,7 +410,7 @@ export default async function handler(req, res) {
         source: 'fallback',
       });
     } catch (logError) {
-      console.error('Firestore logging error:', logError);
+        console.error('Firestore logging error:', firestoreHint(logError));
     }
 
     return res.status(200).json({
