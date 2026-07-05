@@ -142,8 +142,7 @@ async function callOpenAI(name, userQuery) {
           { role: 'system', content: PRAYER_SYSTEM_PROMPT },
           { role: 'user', content: PRAYER_USER_PROMPT(name, userQuery) },
         ],
-        max_tokens: 200,
-        temperature: 0.7,
+       max_completion_tokens: 200,
       }),
       signal: controller.signal,
     });
