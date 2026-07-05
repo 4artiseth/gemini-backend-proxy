@@ -80,9 +80,26 @@ function firestoreHint(error) {
   return message;
 }
 
-initializeFirebaseAdmin();
+let db = null;
 
-const db = admin.firestore();
+function getDb() {
+  if (db) {
+    return db;
+  }
+  initializeFirebaseAdmin();
+  db = admin.firestore();
+  return db;
+}
+
+function firebaseReady() {
+  try {
+    getDb();
+    return true;
+  } catch (err) {
+    console.error('Firebase unavailable:', err.message);
+    return false;
+  }
+}
 
 const cache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
@@ -128,6 +145,9 @@ function getClientIp(req) {
 }
 
 async function verifyAuth(req) {
+  if (!firebaseReady()) {
+    return null;
+  }
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
     return null;
@@ -144,7 +164,10 @@ async function verifyAuth(req) {
 }
 
 async function isUserPro(uid) {
-  const snap = await db
+  if (!firebaseReady()) {
+    return false;
+  }
+  const snap = await getDb()
     .collection('users')
     .doc(uid)
     .collection('entitlements')
@@ -159,9 +182,13 @@ async function checkAndIncrementPrayerUsage(userDocId, uidForProCheck) {
   }
 
   const today = todayKey();
-  const ref = db.collection('users').doc(userDocId).collection('usage').doc('status');
+  if (!firebaseReady()) {
+    return { ok: true, remaining: FREE_PRAYER_DAILY_LIMIT - 1, isPro: false };
+  }
 
-  return db.runTransaction(async (tx) => {
+  const ref = getDb().collection('users').doc(userDocId).collection('usage').doc('status');
+
+  return getDb().runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const data = snap.exists ? snap.data() : {};
     const prayerDate = data.prayerDate || '';
@@ -323,7 +350,7 @@ export default async function handler(req, res) {
         randomFallback();
 
       try {
-        await db.collection('requests').add({
+        await getDb().collection('requests').add({
           name: sanitizedName || null,
           email: email || null,
           user_query: trimmedQuery,
@@ -364,7 +391,7 @@ export default async function handler(req, res) {
     });
 
     try {
-      await db.collection('requests').add({
+      await getDb().collection('requests').add({
         name: sanitizedName || null,
         email: email || null,
         user_query: trimmedQuery,
@@ -397,7 +424,7 @@ export default async function handler(req, res) {
     const fallbackResponse = randomFallback();
 
     try {
-      await db.collection('requests').add({
+      await getDb().collection('requests').add({
         name: req.body?.name || null,
         email: req.body?.email || null,
         user_query: req.body?.user_query || 'unknown',
